@@ -160,17 +160,13 @@ generate_config() {
 
     local pvk v6_addr res_val
     pvk=$(cat /etc/s-box/warp_pvk.log 2>/dev/null)
-    pvk=${pvk:-"g9I2sgUH6OCbIBTehkEfVEnuvInHYZvPOFhWchMLSc4="}
     v6_addr=$(cat /etc/s-box/warp_v6.log 2>/dev/null)
-    v6_addr=${v6_addr:-"2606:4700:110:860e:738f:b37:f15:d38d"}
     res_val=$(cat /etc/s-box/warp_res.log 2>/dev/null)
-    res_val=${res_val:-"[33,217,129]"}
 
     local warp_domains_json="[]"
-    if [[ -f /etc/s-box/warp_domains.log && -s /etc/s-box/warp_domains.log ]]; then
+    if [[ -f /etc/s-box/warp_domains.log ]]; then
         warp_domains_json=$(cat /etc/s-box/warp_domains.log)
     fi
-    warp_domains_json=${warp_domains_json:-"[]"}
 
     cat > /etc/s-box/sb.json <<EOF
 {
