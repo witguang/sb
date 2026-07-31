@@ -107,11 +107,24 @@ install_cloudflared() {
     fi
 }
 
+# 辅助函数：根据 UUID 转换 Path 路径 (调换第1段与第5段，后缀变 -ao)
+generate_custom_path() {
+    local uuid="$1"
+    local p1 p2 p3 p4 p5
+    IFS="-" read -r p1 p2 p3 p4 p5 <<< "$uuid"
+    if [[ -n "$p1" && -n "$p5" ]]; then
+        echo "${p5}-${p2}-${p3}-${p4}-${p1}-ao"
+    else
+        echo "${uuid}-ao"
+    fi
+}
+
 # 5. 生成服务端配置文件
 generate_config() {
-    local port=${1:-8080}
+    local port=${1:-8088}
     local uuid=${2:-$(/etc/s-box/sing-box generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)}
-    local ws_path=${3:-"${uuid}-vm"}
+    local ws_path
+    ws_path=$(generate_custom_path "$uuid")
 
     cat > /etc/s-box/sb.json <<EOF
 {
@@ -188,7 +201,7 @@ EOF
 setup_argo() {
     install_cloudflared
     local port
-    port=$(cat /etc/s-box/port.log 2>/dev/null || echo "8080")
+    port=$(cat /etc/s-box/port.log 2>/dev/null || echo "8088")
 
     echo
     green "选择 Argo 隧道模式："
@@ -631,8 +644,11 @@ manage_local_sub() {
     readp "请选择【1-2】: " sub_choice
 
     if [[ "$sub_choice" == "1" ]]; then
-        readp "请输入订阅端口 (默认 8888): " sub_port
-        sub_port=${sub_port:-8888}
+        local sub_port sub_token
+        sub_port=$(shuf -i 10000-65535 -n 1)
+        readp "请输入订阅端口 (回车默认随机使用 ${sub_port}): " user_sub_port
+        sub_port=${user_sub_port:-$sub_port}
+        
         readp "请输入订阅路径 Token (回车默认使用 UUID): " sub_token
         sub_token=${sub_token:-$(cat /etc/s-box/uuid.log 2>/dev/null)}
 
@@ -742,6 +758,7 @@ show_node() {
     echo -e "传输协议     : ${yellow}WebSocket (ws)${plain}"
     echo -e "Path 路径    : ${yellow}/${path}${plain}"
     echo -e "Argo 域名    : ${yellow}${argo_domain:-未获取到}${plain}"
+    echo -e "优选域名/IP  : ${argo_domain:-未获取到}${plain}"
     echo -e "优选域名/IP  : ${yellow}${cdn_ip}${plain}"
     echo -e "TLS 端口     : ${yellow}8443${plain}"
     white "------------------------------------------------------------------"
@@ -774,8 +791,8 @@ show_node() {
 install_all() {
     install_dependencies
     install_singbox
-    readp "设置 VMess 本地监听端口 (默认 8080): " user_port
-    user_port=${user_port:-8080}
+    readp "设置 VMess 本地监听端口 (默认 8088): " user_port
+    user_port=${user_port:-8088}
     
     generate_config "$user_port"
     setup_service
