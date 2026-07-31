@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
 # Sing-box VMess + WebSocket + TLS + Cloudflare Argo 极简全能版
-# 支持纯净单协议 (Argo VMess TLS) 及三种订阅格式 (.txt / .json / .yaml)
+# 支持三格式订阅 (.txt / .json / .yaml) & WARP-WireGuard-IPv6 域名分流
 # ==============================================================================
 
 export LANG=en_US.UTF-8
@@ -61,16 +61,16 @@ install_dependencies() {
     green "检查并安装必要依赖……"
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -y
-        apt-get install -y curl jq tar wget unzip procps psmisc qrencode git busybox
+        apt-get install -y curl jq tar wget unzip procps psmisc qrencode git busybox python3 xxd
     elif command -v yum >/dev/null 2>&1; then
         yum update -y
-        yum install -y curl jq tar wget unzip procps psmisc qrencode git busybox epel-release
+        yum install -y curl jq tar wget unzip procps psmisc qrencode git busybox python3 xxd epel-release
     elif command -v dnf >/dev/null 2>&1; then
         dnf update -y
-        dnf install -y curl jq tar wget unzip procps psmisc qrencode git busybox
+        dnf install -y curl jq tar wget unzip procps psmisc qrencode git busybox python3 xxd
     elif command -v apk >/dev/null 2>&1; then
         apk update
-        apk add bash curl jq tar wget unzip procps qrencode git busybox
+        apk add bash curl jq tar wget unzip procps qrencode git busybox python3 xxd
     fi
 }
 
@@ -107,6 +107,34 @@ install_cloudflared() {
     fi
 }
 
+# 辅助函数：生成 WARP-WireGuard 账号配置
+generate_warp_wg() {
+    local keypair private_key public_key response reserved_str reserved_hex reserved_dec
+    keypair=$(openssl genpkey -algorithm X25519 2>/dev/null | openssl pkey -text -noout 2>/dev/null)
+    private_key=$(echo "$keypair" | awk "/priv:/{flag=1; next} /pub:/{flag=0} flag" | tr -d "[:space:]" | xxd -r -p 2>/dev/null | base64)
+    public_key=$(echo "$keypair" | awk "/pub:/{flag=1} flag" | tr -d "[:space:]" | xxd -r -p 2>/dev/null | base64)
+
+    response=$(curl -sL --tlsv1.3 --connect-timeout 5 \
+        -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+        -H "CF-Client-Version: a-7.21-0721" \
+        -H "Content-Type: application/json" \
+        -d '{"key": "'"$public_key"'", "tos": "'"$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')"'"}' 2>/dev/null)
+
+    reserved_str=$(echo "$response" | jq -r ".config.client_id" 2>/dev/null)
+    if [[ -n "$reserved_str" && "$reserved_str" != "null" ]]; then
+        reserved_hex=$(echo "$reserved_str" | base64 -d | xxd -p)
+        reserved_dec=$(echo "$reserved_hex" | fold -w2 | while read HEX; do printf "%d " "0x${HEX}"; done | awk "{print \"[\"$1\", \"$2\", \"$3\"]\"}")
+        local v6_addr=$(echo "$response" | jq -r ".config.interface.addresses.v6" 2>/dev/null)
+        echo "$private_key" > /etc/s-box/warp_pvk.log
+        echo "${v6_addr:-2606:4700:110:860e:738f:b37:f15:d38d}" > /etc/s-box/warp_v6.log
+        echo "${reserved_dec:-[33,217,129]}" > /etc/s-box/warp_res.log
+    else
+        echo "g9I2sgUH6OCbIBTehkEfVEnuvInHYZvPOFhWchMLSc4=" > /etc/s-box/warp_pvk.log
+        echo "2606:4700:110:860e:738f:b37:f15:d38d" > /etc/s-box/warp_v6.log
+        echo "[33,217,129]" > /etc/s-box/warp_res.log
+    fi
+}
+
 # 辅助函数：根据 UUID 转换 Path 路径 (调换第1段与第5段，后缀变 -ao)
 generate_custom_path() {
     local uuid="$1"
@@ -125,6 +153,20 @@ generate_config() {
     local uuid=${2:-$(/etc/s-box/sing-box generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)}
     local ws_path
     ws_path=$(generate_custom_path "$uuid")
+
+    if [[ ! -f /etc/s-box/warp_pvk.log ]]; then
+        generate_warp_wg
+    fi
+
+    local pvk v6_addr res_val
+    pvk=$(cat /etc/s-box/warp_pvk.log 2>/dev/null)
+    v6_addr=$(cat /etc/s-box/warp_v6.log 2>/dev/null)
+    res_val=$(cat /etc/s-box/warp_res.log 2>/dev/null)
+
+    local warp_domains_json="[]"
+    if [[ -f /etc/s-box/warp_domains.log ]]; then
+        warp_domains_json=$(cat /etc/s-box/warp_domains.log)
+    fi
 
     cat > /etc/s-box/sb.json <<EOF
 {
@@ -157,8 +199,33 @@ generate_config() {
     {
       "type": "direct",
       "tag": "direct"
+    },
+    {
+      "type": "wireguard",
+      "tag": "warp-IPv6-out",
+      "server": "162.159.192.1",
+      "server_port": 2408,
+      "local_address": [
+        "172.16.0.2/32",
+        "${v6_addr}/128"
+      ],
+      "private_key": "${pvk}",
+      "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+      "reserved": ${res_val:-[0,0,0]}
     }
-  ]
+  ],
+  "route": {
+    "rules": [
+      {
+        "outbound": "warp-IPv6-out",
+        "domain_suffix": ${warp_domains_json}
+      },
+      {
+        "outbound": "direct",
+        "network": "udp,tcp"
+      }
+    ]
+  }
 }
 EOF
     echo "$port" > /etc/s-box/port.log
@@ -169,7 +236,51 @@ EOF
     fi
 }
 
-# 6. 配置服务项
+# 6. 重置/设置 WARP WireGuard IPv6 优先分流域名
+reset_warp_v6_domains() {
+    echo
+    green "【 重置 WARP-WireGuard IPv6 优先分流域名 】"
+    yellow "当前已分流的域名列表："
+    if [[ -f /etc/s-box/warp_domains_raw.log ]]; then
+        blue "  $(cat /etc/s-box/warp_domains_raw.log)"
+    else
+        blue "  未设置 (默认空)"
+    fi
+    echo
+    yellow "请输入需要走 WARP IPv6 出站的域名 (多个域名之间用空格隔开，例如：google.com openai.com netflix.com)"
+    yellow "回车跳过/清空表示重置清空分流通道："
+    readp "域名列表: " input_domains
+
+    if [[ -z "$input_domains" ]]; then
+        echo "[]" > /etc/s-box/warp_domains.log
+        rm -f /etc/s-box/warp_domains_raw.log
+        green "已清空 WARP IPv6 分流域名！"
+    else
+        echo "$input_domains" > /etc/s-box/warp_domains_raw.log
+        local json_arr="["
+        local first=1
+        for dom in $input_domains; do
+            if [[ $first -eq 1 ]]; then
+                json_arr="${json_arr}\"${dom}\""
+                first=0
+            else
+                json_arr="${json_arr},\"${dom}\""
+            fi
+        done
+        json_arr="${json_arr}]"
+        echo "$json_arr" > /etc/s-box/warp_domains.log
+        green "WARP IPv6 分流域名已成功设置为: $input_domains"
+    fi
+
+    local port uuid
+    port=$(cat /etc/s-box/port.log 2>/dev/null || echo "8088")
+    uuid=$(cat /etc/s-box/uuid.log 2>/dev/null)
+    generate_config "$port" "$uuid"
+    setup_service
+    green "Sing-box 服务已重新加载新路由规则！"
+}
+
+# 7. 配置服务项
 setup_service() {
     if command -v systemctl >/dev/null 2>&1; then
         cat > /etc/systemd/system/sing-box.service <<EOF
@@ -197,7 +308,7 @@ EOF
     fi
 }
 
-# 7. 启动/配置 Argo 隧道
+# 8. 启动/配置 Argo 隧道
 setup_argo() {
     install_cloudflared
     local port
@@ -257,7 +368,7 @@ EOF
     update_subscription_files
 }
 
-# 8. 设置 CDN 优选域名 / IP
+# 9. 设置 CDN 优选域名 / IP
 set_cdn_ip() {
     echo
     green "当前优选域名/IP: $(cat /etc/s-box/cdn.log 2>/dev/null || echo "cloudflare-ech.com")"
@@ -276,7 +387,7 @@ set_cdn_ip() {
     update_subscription_files
 }
 
-# 9. 核心：生成三种格式订阅文件 (.txt, .json, .yaml)
+# 10. 核心：生成三种格式订阅文件 (.txt, .json, .yaml)
 update_subscription_files() {
     local uuid port path argo_domain cdn_ip ps_tag
     uuid=$(cat /etc/s-box/uuid.log 2>/dev/null)
@@ -635,7 +746,7 @@ rules:
 EOF
 }
 
-# 10. 管理本地 IP 订阅服务
+# 11. 管理本地 IP 订阅服务
 manage_local_sub() {
     echo
     green "【 本地 IP 订阅管理 】"
@@ -685,7 +796,7 @@ manage_local_sub() {
     fi
 }
 
-# 11. 管理 GitLab 私有订阅
+# 12. 管理 GitLab 私有订阅
 manage_gitlab_sub() {
     echo
     green "【 GitLab 私有订阅管理 】"
@@ -727,7 +838,7 @@ manage_gitlab_sub() {
     cd /root || exit
 }
 
-# 12. 显示节点信息、二维码与三种格式订阅
+# 13. 显示节点信息、二维码与三种格式订阅
 show_node() {
     if [[ ! -f /etc/s-box/sb.json ]]; then
         red "Sing-box 未安装或未生成配置！" && return
@@ -758,7 +869,6 @@ show_node() {
     echo -e "传输协议     : ${yellow}WebSocket (ws)${plain}"
     echo -e "Path 路径    : ${yellow}/${path}${plain}"
     echo -e "Argo 域名    : ${yellow}${argo_domain:-未获取到}${plain}"
-    echo -e "优选域名/IP  : ${argo_domain:-未获取到}${plain}"
     echo -e "优选域名/IP  : ${yellow}${cdn_ip}${plain}"
     echo -e "TLS 端口     : ${yellow}8443${plain}"
     white "------------------------------------------------------------------"
@@ -787,7 +897,7 @@ show_node() {
     fi
 }
 
-# 13. 一键安装全流程
+# 14. 一键安装全流程
 install_all() {
     install_dependencies
     install_singbox
@@ -800,7 +910,7 @@ install_all() {
     show_node
 }
 
-# 14. 卸载函数
+# 15. 卸载函数
 uninstall_all() {
     systemctl stop sing-box argo 2>/dev/null
     systemctl disable sing-box argo 2>/dev/null
@@ -824,28 +934,30 @@ main_menu() {
     green " 2. 查看节点信息与三格式订阅 (.txt / .json / .yaml)"
     green " 3. 设置/修改 CDN 优选域名/IP (针对 Argo TLS 套 CDN)"
     green " 4. 重置 / 切换 Argo 隧道模式 (临时 / 固定)"
-    green " 5. 管理本地 IP 三格式订阅服务 (.txt / .json / .yaml)"
-    green " 6. 管理 GitLab 私有三格式订阅推送 (.txt / .json / .yaml)"
-    green " 7. 重启 Sing-box 服务"
-    green " 8. 停止 Sing-box 服务"
-    green " 9. 查看 Sing-box 运行日志"
-    green "10. 卸载 Sing-box 与 Argo"
+    green " 5. 重置 / 设置 WARP WireGuard IPv6 优先分流域名"
+    green " 6. 管理本地 IP 三格式订阅服务 (.txt / .json / .yaml)"
+    green " 7. 管理 GitLab 私有三格式订阅推送 (.txt / .json / .yaml)"
+    green " 8. 重启 Sing-box 服务"
+    green " 9. 停止 Sing-box 服务"
+    green "10. 查看 Sing-box 运行日志"
+    green "11. 卸载 Sing-box 与 Argo"
     white "------------------------------------------------------------------"
     green " 0. 退出脚本"
     white "=================================================================="
     
-    readp "请输入选项 [0-10]: " choice
+    readp "请输入选项 [0-11]: " choice
     case "$choice" in
         1) install_all ;;
         2) show_node ;;
         3) set_cdn_ip && show_node ;;
         4) setup_argo && show_node ;;
-        5) manage_local_sub ;;
-        6) manage_gitlab_sub ;;
-        7) systemctl restart sing-box && green "服务已重启" ;;
-        8) systemctl stop sing-box && green "服务已停止" ;;
-        9) journalctl -u sing-box.service -o cat -f ;;
-        10) uninstall_all ;;
+        5) reset_warp_v6_domains ;;
+        6) manage_local_sub ;;
+        7) manage_gitlab_sub ;;
+        8) systemctl restart sing-box && green "服务已重启" ;;
+        9) systemctl stop sing-box && green "服务已停止" ;;
+        10) journalctl -u sing-box.service -o cat -f ;;
+        11) uninstall_all ;;
         0) exit 0 ;;
         *) main_menu ;;
     esac
