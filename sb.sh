@@ -163,10 +163,12 @@ generate_config() {
     v6_addr=$(cat /etc/s-box/warp_v6.log 2>/dev/null)
     res_val=$(cat /etc/s-box/warp_res.log 2>/dev/null)
 
+    # 安全读取分流域名配置，防止文件不存在或为空时生成语法错误的 JSON
     local warp_domains_json="[]"
-    if [[ -f /etc/s-box/warp_domains.log ]]; then
+    if [[ -f /etc/s-box/warp_domains.log && -s /etc/s-box/warp_domains.log ]]; then
         warp_domains_json=$(cat /etc/s-box/warp_domains.log)
     fi
+    warp_domains_json=${warp_domains_json:-"[]"}
 
     cat > /etc/s-box/sb.json <<EOF
 {
