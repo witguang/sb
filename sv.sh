@@ -111,8 +111,8 @@ install_cloudflared() {
 generate_warp_wg() {
     local keypair private_key public_key response reserved_str reserved_hex reserved_dec
     keypair=$(openssl genpkey -algorithm X25519 2>/dev/null | openssl pkey -text -noout 2>/dev/null)
-    private_key=$(echo "$keypair" | awk "/priv:/{flag=1; next} /pub:/{flag=0} flag" | tr -d "[:space:]" | xxd -r -p 2>/dev/null | base64)
-    public_key=$(echo "$keypair" | awk "/pub:/{flag=1} flag" | tr -d "[:space:]" | xxd -r -p 2>/dev/null | base64)
+    private_key=$(echo "$keypair" | awk '/priv:/{flag=1; next} /pub:/{flag=0} flag' | tr -d "[:space:]" | xxd -r -p 2>/dev/null | base64)
+    public_key=$(echo "$keypair" | awk '/pub:/{flag=1} flag' | tr -d "[:space:]" | xxd -r -p 2>/dev/null | base64)
 
     response=$(curl -sL --tlsv1.3 --connect-timeout 5 \
         -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
@@ -122,10 +122,19 @@ generate_warp_wg() {
 
     reserved_str=$(echo "$response" | jq -r ".config.client_id" 2>/dev/null)
     if [[ -n "$reserved_str" && "$reserved_str" != "null" ]]; then
-        reserved_hex=$(echo "$reserved_str" | base64 -d | xxd -p)
-        reserved_dec=$(echo "$reserved_hex" | fold -w2 | while read HEX; do printf "%d " "0x${HEX}"; done | awk "{print \"[\"$1\", \"$2\", \"$3\"]\"}")
-        local v6_addr=$(echo "$response" | jq -r ".config.interface.addresses.v6" 2>/dev/null)
-        echo "$private_key" > /etc/s-box/warp_pvk.log
+        reserved_hex=$(echo "$reserved_str" | base64 -d 2>/dev/null | xxd -p 2>/dev/null | tr -d '\n')
+        if [[ -n "$reserved_hex" ]]; then
+            reserved_dec=$(python3 -c "
+h = '$reserved_hex'
+try:
+    print(str([int(h[i:i+2], 16) for i in range(0, len(h), 2)]))
+except Exception:
+    print('[33,217,129]')
+" 2>/dev/null)
+        fi
+        local v6_addr
+        v6_addr=$(echo "$response" | jq -r ".config.interface.addresses.v6" 2>/dev/null)
+        echo "${private_key:-g9I2sgUH6OCbIBTehkEfVEnuvInHYZvPOFhWchMLSc4=}" > /etc/s-box/warp_pvk.log
         echo "${v6_addr:-2606:4700:110:860e:738f:b37:f15:d38d}" > /etc/s-box/warp_v6.log
         echo "${reserved_dec:-[33,217,129]}" > /etc/s-box/warp_res.log
     else
@@ -147,30 +156,36 @@ generate_custom_path() {
     fi
 }
 
-# 5. 生成服务端配置文件 (适配 Sing-box 1.10+ 最新 Endpoints 架构，带完整变量防空保护)
+# 5. 生成服务端配置文件
 generate_config() {
     local port=${1:-8088}
     local uuid=${2:-$(/etc/s-box/sing-box generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)}
     local ws_path
     ws_path=$(generate_custom_path "$uuid")
 
-    if [[ ! -f /etc/s-box/warp_pvk.log ]] || [[ ! -s /etc/s-box/warp_pvk.log ]]; then
+    if [[ ! -s /etc/s-box/warp_pvk.log || ! -s /etc/s-box/warp_res.log ]]; then
         generate_warp_wg
     fi
 
     local pvk v6_addr res_val
-    pvk=$(cat /etc/s-box/warp_pvk.log 2>/dev/null)
+    pvk=$(tr -d '\r\n' < /etc/s-box/warp_pvk.log 2>/dev/null)
     pvk=${pvk:-"g9I2sgUH6OCbIBTehkEfVEnuvInHYZvPOFhWchMLSc4="}
-    v6_addr=$(cat /etc/s-box/warp_v6.log 2>/dev/null)
+    
+    v6_addr=$(tr -d '\r\n' < /etc/s-box/warp_v6.log 2>/dev/null)
     v6_addr=${v6_addr:-"2606:4700:110:860e:738f:b37:f15:d38d"}
-    res_val=$(cat /etc/s-box/warp_res.log 2>/dev/null)
-    res_val=${res_val:-"[33,217,129]"}
+
+    res_val=$(tr -d '\r\n' < /etc/s-box/warp_res.log 2>/dev/null)
+    if [[ ! "$res_val" =~ ^\[.*\]$ ]]; then
+        res_val="[33,217,129]"
+    fi
 
     local warp_domains_json="[]"
-    if [[ -f /etc/s-box/warp_domains.log && -s /etc/s-box/warp_domains.log ]]; then
-        warp_domains_json=$(cat /etc/s-box/warp_domains.log)
+    if [[ -s /etc/s-box/warp_domains.log ]]; then
+        warp_domains_json=$(tr -d '\r\n' < /etc/s-box/warp_domains.log 2>/dev/null)
     fi
-    warp_domains_json=${warp_domains_json:-"[]"}
+    if [[ ! "$warp_domains_json" =~ ^\[.*\]$ ]]; then
+        warp_domains_json="[]"
+    fi
 
     cat > /etc/s-box/sb.json <<EOF
 {
@@ -243,6 +258,18 @@ generate_config() {
   }
 }
 EOF
+
+    # 配置文件结构与语法双重校验
+    if jq . /etc/s-box/sb.json >/dev/null 2>&1; then
+        if /etc/s-box/sing-box check -c /etc/s-box/sb.json >/dev/null 2>&1; then
+            blue "Sing-box 配置文件校验成功。"
+        else
+            yellow "提示：Sing-box 格式校验存在警告，请确保内核版本兼容。"
+        fi
+    else
+        red "错误：生成的配置仍非有效 JSON，请检查变量依赖。"
+    fi
+
     echo "$port" > /etc/s-box/port.log
     echo "$uuid" > /etc/s-box/uuid.log
     echo "$ws_path" > /etc/s-box/path.log
@@ -272,18 +299,9 @@ reset_warp_v6_domains() {
         green "已清空 WARP IPv6 分流域名！"
     else
         echo "$input_domains" > /etc/s-box/warp_domains_raw.log
-        local json_arr="["
-        local first=1
-        for dom in $input_domains; do
-            if [[ $first -eq 1 ]]; then
-                json_arr="${json_arr}\"${dom}\""
-                first=0
-            else
-                json_arr="${json_arr},\"${dom}\""
-            fi
-        done
-        json_arr="${json_arr}]"
-        echo "$json_arr" > /etc/s-box/warp_domains.log
+        local json_arr
+        json_arr=$(echo "$input_domains" | jq -R 'split(" ") | map(select(length > 0))' -c 2>/dev/null)
+        echo "${json_arr:-[]}" > /etc/s-box/warp_domains.log
         green "WARP IPv6 分流域名已成功设置为: $input_domains"
     fi
 
@@ -443,7 +461,7 @@ update_subscription_files() {
 }
 EOF
 )
-    vmess_json_compact=$(echo "$vmess_json" | jq -c .)
+    vmess_json_compact=$(echo "$vmess_json" | jq -c . 2>/dev/null)
     vmess_base64=$(echo -n "$vmess_json_compact" | base64 -w 0)
     vmess_link="vmess://${vmess_base64}"
 
@@ -870,8 +888,6 @@ show_node() {
     if [[ -z "$argo_domain" && -f /etc/s-box/argo.log ]]; then
         argo_domain=$(grep -a -oE "[a-zA-Z0-9.-]+\\.trycloudflare\\.com" /etc/s-box/argo.log | head -n 1)
     fi
-
-    local sni_host="${argo_domain:-example.com}"
 
     white "=================================================================="
     blue "🚀【 VMess + WebSocket + TLS + Cloudflare Argo 】节点信息："
