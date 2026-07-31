@@ -1,6 +1,7 @@
 #!/bin/bash
 # ==============================================================================
 # Sing-box VMess + WebSocket + TLS + Cloudflare Argo 极简全能版
+# 支持纯净单协议 (Argo VMess TLS) 及三种订阅格式 (.txt / .json / .yaml)
 # ==============================================================================
 
 export LANG=en_US.UTF-8
@@ -230,7 +231,7 @@ EOF
         green "正在生成临时 Argo 域名，请等待 10 秒……"
         sleep 10
         local temp_domain
-        temp_domain=$(grep -a -oE "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" /etc/s-box/argo.log | head -n 1 | sed "s|https://||")
+        temp_domain=$(grep -a -oE "https://[a-zA-Z0-9.-]+\\.trycloudflare\\.com" /etc/s-box/argo.log | head -n 1 | sed "s|https://||")
         if [[ -n "$temp_domain" ]]; then
             echo "$temp_domain" > /etc/s-box/argoym.log
             echo "VMess-Argo-TLS-Temp" > /etc/s-box/ps_tag.log
@@ -262,7 +263,7 @@ set_cdn_ip() {
     update_subscription_files
 }
 
-# 9. 生成客户端订阅文件 (sbox.json, clmi.yaml, jhsub.txt)
+# 9. 核心：生成三种格式订阅文件 (.txt, .json, .yaml)
 update_subscription_files() {
     local uuid port path argo_domain cdn_ip ps_tag
     uuid=$(cat /etc/s-box/uuid.log 2>/dev/null)
@@ -273,12 +274,16 @@ update_subscription_files() {
     ps_tag=$(cat /etc/s-box/ps_tag.log 2>/dev/null || echo "VMess-Argo-TLS-Temp")
 
     if [[ -z "$argo_domain" && -f /etc/s-box/argo.log ]]; then
-        argo_domain=$(grep -a -oE "[a-zA-Z0-9.-]+\.trycloudflare\.com" /etc/s-box/argo.log | head -n 1)
+        argo_domain=$(grep -a -oE "[a-zA-Z0-9.-]+\\.trycloudflare\\.com" /etc/s-box/argo.log | head -n 1)
     fi
 
     local sni_host="${argo_domain:-example.com}"
 
-    # 1) 生成 VMess 节点链接 (端口 8443)
+    mkdir -p /etc/s-box/web
+
+    # --------------------------------------------------------------------------
+    # 格式 1: .txt 聚合分享链接 (VMess 链接文件 jhsub.txt)
+    # --------------------------------------------------------------------------
     local vmess_json vmess_json_compact vmess_base64 vmess_link
     vmess_json=$(cat <<EOF
 {
@@ -303,58 +308,270 @@ EOF
     vmess_base64=$(echo -n "$vmess_json_compact" | base64 -w 0)
     vmess_link="vmess://${vmess_base64}"
 
-    mkdir -p /etc/s-box/web
-
-    # 2) 聚合链接文件
     echo "$vmess_link" > /etc/s-box/web/jhsub.txt
 
-    # 3) Sing-box 客户端 sbox.json
+    # --------------------------------------------------------------------------
+    # 格式 2: .json (Sing-box 客户端完整配置 sbox.json)
+    # 包含 DoH DNS、Fake-IP 隔离、download_detour: direct 防死锁及 PacketAddr
+    # --------------------------------------------------------------------------
     cat > /etc/s-box/web/sbox.json <<EOF
 {
-  "log": { "disabled": false, "level": "info", "timestamp": true },
+  "log": {
+    "disabled": false,
+    "level": "info",
+    "timestamp": true
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "./cache.db",
+      "store_fakeip": true
+    },
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "external_ui": "ui",
+      "default_mode": "Rule"
+    }
+  },
   "dns": {
     "servers": [
-      { "tag": "dns-remote", "address": "https://dns.google/dns-query", "detour": "proxy" },
-      { "tag": "dns-direct", "address": "223.5.5.5", "detour": "direct" }
+      {
+        "tag": "aliDns",
+        "type": "https",
+        "server": "dns.alidns.com",
+        "path": "/dns-query",
+        "domain_resolver": "local"
+      },
+      {
+        "tag": "local",
+        "type": "udp",
+        "server": "223.5.5.5"
+      },
+      {
+        "tag": "proxyDns",
+        "type": "https",
+        "server": "dns.google",
+        "path": "/dns-query",
+        "domain_resolver": "aliDns",
+        "detour": "proxy"
+      },
+      {
+        "type": "fakeip",
+        "tag": "fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
     ],
     "rules": [
-      { "outbound": "any", "server": "dns-direct" }
-    ]
+      {
+        "rule_set": "geosite-cn",
+        "clash_mode": "Rule",
+        "server": "aliDns"
+      },
+      {
+        "clash_mode": "Direct",
+        "server": "local"
+      },
+      {
+        "clash_mode": "Global",
+        "server": "proxyDns"
+      },
+      {
+        "query_type": ["A", "AAAA"],
+        "server": "fakeip"
+      }
+    ],
+    "final": "proxyDns",
+    "strategy": "prefer_ipv4"
   },
   "inbounds": [
-    { "type": "tun", "tag": "tun-in", "inet4_address": "172.19.0.1/30", "auto_route": true, "strict_route": true }
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": ["172.19.0.1/30", "fd00::1/126"],
+      "auto_route": true,
+      "strict_route": true
+    }
   ],
+  "route": {
+    "rules": [
+      {
+        "inbound": "tun-in",
+        "action": "sniff"
+      },
+      {
+        "type": "logical",
+        "mode": "or",
+        "rules": [
+          { "port": 53 },
+          { "protocol": "dns" }
+        ],
+        "action": "hijack-dns"
+      },
+      {
+        "clash_mode": "Global",
+        "outbound": "proxy"
+      },
+      {
+        "rule_set": ["geosite-telegram", "geoip-telegram"],
+        "clash_mode": "Rule",
+        "outbound": "proxy"
+      },
+      {
+        "rule_set": "geosite-cn",
+        "clash_mode": "Rule",
+        "outbound": "direct"
+      },
+      {
+        "rule_set": "geoip-cn",
+        "clash_mode": "Rule",
+        "outbound": "direct"
+      },
+      {
+        "ip_is_private": true,
+        "clash_mode": "Rule",
+        "outbound": "direct"
+      },
+      {
+        "clash_mode": "Direct",
+        "outbound": "direct"
+      }
+    ],
+    "rule_set": [
+      {
+        "tag": "geosite-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs",
+        "download_detour": "direct"
+      },
+      {
+        "tag": "geoip-cn",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
+        "download_detour": "direct"
+      },
+      {
+        "tag": "geosite-telegram",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/telegram.srs",
+        "download_detour": "direct"
+      },
+      {
+        "tag": "geoip-telegram",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/telegram.srs",
+        "download_detour": "direct"
+      }
+    ],
+    "final": "proxy",
+    "auto_detect_interface": true,
+    "default_domain_resolver": {
+      "server": "aliDns"
+    }
+  },
   "outbounds": [
     {
       "type": "vmess",
-      "tag": "proxy",
+      "tag": "proxy-vmess",
       "server": "${cdn_ip}",
       "server_port": 8443,
       "uuid": "${uuid}",
       "security": "auto",
+      "packet_encoding": "packetaddr",
       "transport": {
         "type": "ws",
         "path": "/${path}",
-        "headers": { "Host": "${sni_host}" }
+        "headers": {
+          "Host": ["${sni_host}"]
+        }
       },
       "tls": {
         "enabled": true,
         "server_name": "${sni_host}",
         "insecure": false,
-        "utls": { "enabled": true, "fingerprint": "chrome" }
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
       }
     },
-    { "type": "direct", "tag": "direct" }
+    {
+      "tag": "proxy",
+      "type": "selector",
+      "default": "auto",
+      "outbounds": [
+        "auto",
+        "proxy-vmess"
+      ]
+    },
+    {
+      "tag": "auto",
+      "type": "urltest",
+      "outbounds": [
+        "proxy-vmess"
+      ],
+      "url": "http://www.gstatic.com/generate_204",
+      "interval": "10m",
+      "tolerance": 50
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
   ]
 }
 EOF
 
-    # 4) Mihomo / Clash Meta 客户端 clmi.yaml
+    # --------------------------------------------------------------------------
+    # 格式 3: .yaml (Mihomo / Clash Meta 客户端完整配置 clmi.yaml)
+    # 包含 unified-delay、fake-ip-filter、DoH DNS 与完整 GEOSITE+GEOIP 分流
+    # --------------------------------------------------------------------------
     cat > /etc/s-box/web/clmi.yaml <<EOF
 port: 7890
 allow-lan: true
 mode: rule
 log-level: info
+unified-delay: true
+dns:
+  enable: true 
+  listen: "0.0.0.0:1053"
+  ipv6: false
+  prefer-h3: false
+  respect-rules: true
+  use-system-hosts: false
+  cache-algorithm: "arc"
+  enhanced-mode: "fake-ip"
+  fake-ip-range: "198.18.0.1/16"
+  fake-ip-filter:
+    - "+.lan"
+    - "+.local"
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
+    - "localhost.ptlogin2.qq.com"
+    - "localhost.sec.qq.com"
+    - "+.in-addr.arpa"
+    - "+.ip6.arpa"
+    - "time.*.com"
+    - "time.*.gov"
+    - "pool.ntp.org"
+    - "localhost.work.weixin.qq.com"
+  default-nameserver: ["223.5.5.5", "119.29.29.29"]
+  nameserver:
+    - "https://208.67.222.222/dns-query"
+    - "https://1.1.1.1/dns-query"
+    - "https://8.8.4.4/dns-query"
+  proxy-server-nameserver:
+    - "https://223.5.5.5/dns-query"
+    - "https://doh.pub/dns-query"
+  nameserver-policy:
+    "geosite:private,cn":
+      - "https://223.5.5.5/dns-query"
+      - "https://doh.pub/dns-query"
+
 proxies:
   - name: "${ps_tag}"
     type: vmess
@@ -371,15 +588,37 @@ proxies:
       path: "/${path}"
       headers:
         Host: "${sni_host}"
+
 proxy-groups:
-  - name: 🚀 节点选择
-    type: select
+  - name: 负载均衡
+    type: load-balance
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    strategy: round-robin
     proxies:
       - "${ps_tag}"
+
+  - name: 自动选择
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    proxies:
+      - "${ps_tag}"
+
+  - name: 🌍选择代理节点
+    type: select
+    proxies:
+      - 负载均衡
+      - 自动选择
       - DIRECT
+      - "${ps_tag}"
+
 rules:
   - GEOIP,LAN,DIRECT
-  - MATCH,🚀 节点选择
+  - GEOSITE,CN,DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,🌍选择代理节点
 EOF
 }
 
@@ -417,11 +656,11 @@ manage_local_sub() {
         echo "$sub_port" > /etc/s-box/sub_port.log
         echo "$sub_token" > /etc/s-box/sub_token.log
 
-        green "本地 IP 订阅服务已启动！"
+        green "本地 IP 订阅服务已启动！三种格式地址如下："
         white "------------------------------------------------------------------"
-        echo -e "Sing-box 订阅  : ${yellow}http://${public_ip}:${sub_port}/${sub_token}/sbox.json${plain}"
-        echo -e "Mihomo/Clash   : ${yellow}http://${public_ip}:${sub_port}/${sub_token}/clmi.yaml${plain}"
-        echo -e "聚合节点链接   : ${yellow}http://${public_ip}:${sub_port}/${sub_token}/jhsub.txt${plain}"
+        echo -e "1. 节点链接 (.txt)   : ${yellow}http://${public_ip}:${sub_port}/${sub_token}/jhsub.txt${plain}"
+        echo -e "2. Sing-box (.json)  : ${yellow}http://${public_ip}:${sub_port}/${sub_token}/sbox.json${plain}"
+        echo -e "3. Mihomo   (.yaml)  : ${yellow}http://${public_ip}:${sub_port}/${sub_token}/clmi.yaml${plain}"
         white "------------------------------------------------------------------"
     else
         pkill -f "httpd.*s-box" 2>/dev/null
@@ -460,11 +699,11 @@ manage_gitlab_sub() {
 
     green "正在推送订阅配置至 GitLab……"
     if git push -u origin "${git_branch}" --force >/dev/null 2>&1; then
-        green "GitLab 订阅推送成功！"
+        green "GitLab 订阅推送成功！三种格式地址如下："
         white "------------------------------------------------------------------"
-        echo -e "Sing-box 订阅  : ${yellow}https://gitlab.com/api/v4/projects/${git_user}%2F${git_repo}/repository/files/sbox.json/raw?ref=${git_branch}&private_token=${git_token}${plain}"
-        echo -e "Mihomo/Clash   : ${yellow}https://gitlab.com/api/v4/projects/${git_user}%2F${git_repo}/repository/files/clmi.yaml/raw?ref=${git_branch}&private_token=${git_token}${plain}"
-        echo -e "聚合节点链接   : ${yellow}https://gitlab.com/api/v4/projects/${git_user}%2F${git_repo}/repository/files/jhsub.txt/raw?ref=${git_branch}&private_token=${git_token}${plain}"
+        echo -e "1. 节点链接 (.txt)   : ${yellow}https://gitlab.com/api/v4/projects/${git_user}%2F${git_repo}/repository/files/jhsub.txt/raw?ref=${git_branch}&private_token=${git_token}${plain}"
+        echo -e "2. Sing-box (.json)  : ${yellow}https://gitlab.com/api/v4/projects/${git_user}%2F${git_repo}/repository/files/sbox.json/raw?ref=${git_branch}&private_token=${git_token}${plain}"
+        echo -e "3. Mihomo   (.yaml)  : ${yellow}https://gitlab.com/api/v4/projects/${git_user}%2F${git_repo}/repository/files/clmi.yaml/raw?ref=${git_branch}&private_token=${git_token}${plain}"
         white "------------------------------------------------------------------"
     else
         red "GitLab 推送失败，请检查 Token 权限或仓库名称是否正确。"
@@ -472,7 +711,7 @@ manage_gitlab_sub() {
     cd /root || exit
 }
 
-# 12. 显示节点信息与二维码
+# 12. 显示节点信息、二维码与三种格式订阅
 show_node() {
     if [[ ! -f /etc/s-box/sb.json ]]; then
         red "Sing-box 未安装或未生成配置！" && return
@@ -510,22 +749,23 @@ show_node() {
     local vmess_link
     vmess_link=$(cat /etc/s-box/web/jhsub.txt 2>/dev/null)
 
-    echo -e "分享链接："
+    echo -e "分享链接 (.txt 格式)："
     echo -e "${yellow}${vmess_link}${plain}"
     echo
     echo -e "二维码："
     qrencode -o - -t ANSIUTF8 "${vmess_link}" 2>/dev/null
     white "=================================================================="
 
-    # 如果启动了本地订阅，额外打印订阅链接
+    # 如果启动了本地订阅，打印三种格式链接
     if [[ -f /etc/s-box/sub_port.log && -f /etc/s-box/sub_token.log ]]; then
         local sub_port sub_token public_ip
         sub_port=$(cat /etc/s-box/sub_port.log)
         sub_token=$(cat /etc/s-box/sub_token.log)
         public_ip=$(get_public_ip)
-        echo -e "本地 IP 订阅 URL :"
-        echo -e " - Sing-box  : ${yellow}http://${public_ip}:${sub_port}/${sub_token}/sbox.json${plain}"
-        echo -e " - Mihomo/Clash: ${yellow}http://${public_ip}:${sub_port}/${sub_token}/clmi.yaml${plain}"
+        echo -e "本地 IP 三种格式订阅 URL :"
+        echo -e " 1. 节点链接 (.txt)  : ${yellow}http://${public_ip}:${sub_port}/${sub_token}/jhsub.txt${plain}"
+        echo -e " 2. Sing-box (.json) : ${yellow}http://${public_ip}:${sub_port}/${sub_token}/sbox.json${plain}"
+        echo -e " 3. Mihomo   (.yaml) : ${yellow}http://${public_ip}:${sub_port}/${sub_token}/clmi.yaml${plain}"
         white "=================================================================="
     fi
 }
@@ -564,11 +804,11 @@ main_menu() {
     blue "     Sing-box (VMess + WS + TLS + Cloudflare Argo) 极简全能版     "
     white "=================================================================="
     green " 1. 一键安装/重置 VMess + Argo TLS"
-    green " 2. 查看当前节点信息 & 二维码"
+    green " 2. 查看节点信息与三格式订阅 (.txt / .json / .yaml)"
     green " 3. 设置/修改 CDN 优选域名/IP (针对 Argo TLS 套 CDN)"
     green " 4. 重置 / 切换 Argo 隧道模式 (临时 / 固定)"
-    green " 5. 管理本地 IP 订阅服务 (httpd / Python HTTP)"
-    green " 6. 管理 GitLab 私有订阅推送"
+    green " 5. 管理本地 IP 三格式订阅服务 (.txt / .json / .yaml)"
+    green " 6. 管理 GitLab 私有三格式订阅推送 (.txt / .json / .yaml)"
     green " 7. 重启 Sing-box 服务"
     green " 8. 停止 Sing-box 服务"
     green " 9. 查看 Sing-box 运行日志"
