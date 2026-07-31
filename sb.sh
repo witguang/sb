@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Sing-box VMess + WebSocket + TLS + Cloudflare Argo 极简全能版
+# Sing-box (适配 1.10+ 最新版) VMess + WS + TLS + Cloudflare Argo
 # 支持三格式订阅 (.txt / .json / .yaml) & WARP-WireGuard-IPv6 域名分流
 # ==============================================================================
 
@@ -135,7 +135,7 @@ generate_warp_wg() {
     fi
 }
 
-# 辅助函数：根据 UUID 转换 Path 路径 (调换第1段与第5段，后缀变 -ao)
+# 辅助函数：根据 UUID 转换 Path 路径
 generate_custom_path() {
     local uuid="$1"
     local p1 p2 p3 p4 p5
@@ -147,7 +147,7 @@ generate_custom_path() {
     fi
 }
 
-# 5. 生成服务端配置文件
+# 5. 生成服务端配置文件 (适配 Sing-box 1.10+ 最新 Endpoints 架构)
 generate_config() {
     local port=${1:-8088}
     local uuid=${2:-$(/etc/s-box/sing-box generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)}
@@ -160,10 +160,12 @@ generate_config() {
 
     local pvk v6_addr res_val
     pvk=$(cat /etc/s-box/warp_pvk.log 2>/dev/null)
+    pvk=${pvk:-"g9I2sgUH6OCbIBTehkEfVEnuvInHYZvPOFhWchMLSc4="}
     v6_addr=$(cat /etc/s-box/warp_v6.log 2>/dev/null)
+    v6_addr=${v6_addr:-"2606:4700:110:860e:738f:b37:f15:d38d"}
     res_val=$(cat /etc/s-box/warp_res.log 2>/dev/null)
+    res_val=${res_val:-"[33,217,129]"}
 
-    # 安全读取分流域名配置，防止文件不存在或为空时生成语法错误的 JSON
     local warp_domains_json="[]"
     if [[ -f /etc/s-box/warp_domains.log && -s /etc/s-box/warp_domains.log ]]; then
         warp_domains_json=$(cat /etc/s-box/warp_domains.log)
@@ -197,23 +199,34 @@ generate_config() {
       }
     }
   ],
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "warp-wg",
+      "address": [
+        "172.16.0.2/32",
+        "${v6_addr}/128"
+      ],
+      "private_key": "${pvk}",
+      "peers": [
+        {
+          "server": "162.159.192.1",
+          "server_port": 2408,
+          "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+          "reserved": ${res_val}
+        }
+      ]
+    }
+  ],
   "outbounds": [
     {
       "type": "direct",
       "tag": "direct"
     },
     {
-      "type": "wireguard",
+      "type": "direct",
       "tag": "warp-IPv6-out",
-      "server": "162.159.192.1",
-      "server_port": 2408,
-      "local_address": [
-        "172.16.0.2/32",
-        "${v6_addr}/128"
-      ],
-      "private_key": "${pvk}",
-      "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-      "reserved": ${res_val:-[0,0,0]}
+      "detour": "warp-wg"
     }
   ],
   "route": {
@@ -438,7 +451,6 @@ EOF
 
     # --------------------------------------------------------------------------
     # 格式 2: .json (Sing-box 客户端完整配置 sbox.json)
-    # 包含 DoH DNS、Fake-IP 隔离、download_detour: direct 防死锁及 PacketAddr
     # --------------------------------------------------------------------------
     cat > /etc/s-box/web/sbox.json <<EOF
 {
@@ -654,7 +666,6 @@ EOF
 
     # --------------------------------------------------------------------------
     # 格式 3: .yaml (Mihomo / Clash Meta 客户端完整配置 clmi.yaml)
-    # 包含 unified-delay、fake-ip-filter、DoH DNS 与完整 GEOSITE+GEOIP 分流
     # --------------------------------------------------------------------------
     cat > /etc/s-box/web/clmi.yaml <<EOF
 port: 7890
